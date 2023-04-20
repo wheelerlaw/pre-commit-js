@@ -5,7 +5,10 @@ var spawn = require('cross-spawn')
   , path = require('path')
   , util = require('util')
   , tty = require('tty');
-
+var fs = require('fs');
+var color = require('colors/safe');
+var assign = require('lodash.assign');
+var forEach = require('lodash.foreach');
 /**
  * Representation of a hook runner.
  *
@@ -25,6 +28,7 @@ function Hook(fn, options) {
   this.git = '';              // The location of the `git` binary.
   this.root = '';             // The root location of the .git folder.
   this.status = '';           // Contents of the `git status`.
+  this.lint = {};
   this.exit = fn;             // Exit function.
 
   this.initialize();
@@ -84,8 +88,8 @@ Hook.prototype.parse = function parse() {
     var value;
 
     if (flag in config) value = config[flag];
-    else if ('precommit.'+ flag in this.json) value = this.json['precommit.'+ flag];
-    else if ('pre-commit.'+ flag in this.json) value = this.json['pre-commit.'+ flag];
+    else if ('precommit.' + flag in this.json) value = this.json['precommit.' + flag];
+    else if ('pre-commit.' + flag in this.json) value = this.json['pre-commit.' + flag];
     else return;
 
     config[flag] = value;
@@ -94,11 +98,13 @@ Hook.prototype.parse = function parse() {
   //
   // The scripts we need to run can be set under the `run` property.
   //
-  config.run = config.run || pre;
+  if (Array.isArray(pre) || typeof pre == 'string') {
+    config.run = pre;
+  }
 
   if ('string' === typeof config.run) config.run = config.run.split(/[, ]+/);
   if (
-       !Array.isArray(config.run)
+    !Array.isArray(config.run)
     && this.json.scripts
     && this.json.scripts.test
     && this.json.scripts.test !== 'echo "Error: no test specified" && exit 1'
@@ -117,12 +123,12 @@ Hook.prototype.parse = function parse() {
  * @api public
  */
 Hook.prototype.log = function log(lines, exit) {
+  if (exit === undefined) exit = 1;
   if (!Array.isArray(lines)) lines = lines.split('\n');
-  if ('number' !== typeof exit) exit = 1;
 
   var prefix = this.colors
-  ? '\u001b[38;5;166mpre-commit:\u001b[39;49m '
-  : 'pre-commit: ';
+    ? '\u001b[38;5;166mpre-commit:\u001b[39;49m '
+    : 'pre-commit: ';
 
   lines.push('');     // Whitespace at the end of the log.
   lines.unshift('');  // Whitespace at the beginning.
@@ -136,7 +142,7 @@ Hook.prototype.log = function log(lines, exit) {
     else console.log(line);
   });
 
-  this.exit(exit, lines);
+  exit !== false && this.exit(exit, lines);
   return exit === 0;
 };
 
@@ -149,7 +155,7 @@ Hook.prototype.log = function log(lines, exit) {
 Hook.prototype.initialize = function initialize() {
   ['git', 'npm'].forEach(function each(binary) {
     try { this[binary] = which.sync(binary); }
-    catch (e) {}
+    catch (e) { }
   }, this);
 
   //
@@ -172,12 +178,15 @@ Hook.prototype.initialize = function initialize() {
 
   this.root = this.exec(this.git, ['rev-parse', '--show-toplevel']);
   this.status = this.exec(this.git, ['status', '--porcelain']);
+  this.diffs = this.exec(this.git, ['diff', '--cached', '--name-only', '--diff-filter=ACM']);
 
   if (this.status.code) return this.log(Hook.log.status, 0);
   if (this.root.code) return this.log(Hook.log.root, 0);
 
   this.status = this.status.stdout.toString().trim();
   this.root = this.root.stdout.toString().trim();
+  this.diffs = this.diffs.stdout.toString().trim();
+  this.diffs = this.diffs ? this.diffs.split('\n') : [];
 
   try {
     this.json = require(path.join(this.root, 'package.json'));
@@ -188,7 +197,7 @@ Hook.prototype.initialize = function initialize() {
   // We can only check for changes after we've parsed the package.json as it
   // contains information if we need to suppress the empty message or not.
   //
-  if (!this.status.length && !this.options.ignorestatus) {
+  if (!this.status.length && !this.options.ignorestatus && !this.diffs.length) {
     return this.log(Hook.log.empty, 0);
   }
 
@@ -201,9 +210,62 @@ Hook.prototype.initialize = function initialize() {
     this.exec(this.git, ['config', 'commit.template', this.config.template]);
   }
 
-  if (!this.config.run) return this.log(Hook.log.run, 0);
+  if (!this.config.run) return this.log(Hook.log.run, false);
 };
 
+Hook.prototype.runLint = function runLint() {
+  var hooked = this;
+  if (hooked.config && hooked.config.lint === 'false') {
+    return hooked.exit(0);
+  }
+  var lintConfig = assign({
+    stylelint: ".(s?css)|(less)$",
+    eslint: ".jsx?$"
+  }, hooked.config.lint || {});
+  var allLintPass = true;
+  forEach(lintConfig, function (value, key) {
+    if (value === 'false') {
+      return;
+    }
+    var cmdpath = hooked.root + '/node_modules/.bin/' + key;
+    if (!fs.existsSync(cmdpath)) {
+      try {
+        cmdpath = which.sync(key);
+      } catch (e) {
+        cmdpath = '';
+      }
+    }
+    if (cmdpath) {
+      var reg = new RegExp(value);
+      var pass = true;
+      var fileCount = 0;
+
+      console.log(color.green(key + ' validation start'));
+      forEach(hooked.diffs, function (diff) {
+        if (!reg.test(diff)) return;
+        fileCount++;
+        var res = hooked.exec(cmdpath, [diff, '--quiet', '--fix']);
+        if (res.code || res.stdout.toString().length) {
+          console.log(color.red('\t' + key + ' Failed: ' + diff));
+          // console.log(res.stdout.toString());
+          pass = false;
+          allLintPass = false;
+        } else {
+          console.log(color.green('\t' + key + ' Passed: ' + diff));
+        }
+      });
+      console.log(color.green(key + ' validation completed: ' + (fileCount ? (pass ? 'Passed' : color.red('Failed')) : 'no files change') + '\n'));
+    } else {
+      if (hooked.config.lint && hooked.config.lint[key]) {
+        return hooked.log(hooked.format(Hook.log.notFoundError, key, key), 1);
+      }
+      hooked.log(hooked.format(Hook.log.notFoundWarn, key, key, key), false);
+    }
+  });
+  if (!allLintPass) {
+    hooked.exit(1);
+  }
+}
 /**
  * Run the specified hooks.
  *
@@ -213,9 +275,15 @@ Hook.prototype.run = function runner() {
   var hooked = this;
 
   (function again(scripts) {
-    if (!scripts.length) return hooked.exit(0);
+    if (!scripts.length) {
+      hooked.runLint();
+      return hooked.exit(0);
+    }
 
     var script = scripts.shift();
+    if (!script) { // empty str, run next
+      return again(scripts);
+    }
 
     //
     // There's a reason on why we're using an async `spawn` here instead of the
@@ -234,7 +302,7 @@ Hook.prototype.run = function runner() {
 
       again(scripts);
     });
-  })(hooked.config.run.slice(0));
+  })((hooked.config.run || []).slice(0));
 };
 
 /**
@@ -295,7 +363,17 @@ Hook.log = {
     '  git commit -n (or --no-verify)',
     '',
     'This is ill-advised since the commit is broken.'
-  ].join('\n')
+  ].join('\n'),
+
+  notFoundError: [
+    '`%s` not found, please install the package first',
+    '  npm install %s --save-dev',
+  ].join('\n'),
+
+  notFoundWarn: [
+    '`%s` not found, skip `%s`. you can install this package',
+    '  npm install %s --save-dev',
+  ].join('\n'),
 };
 
 //
