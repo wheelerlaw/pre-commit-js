@@ -3,71 +3,94 @@
 //
 // Compatibility with older node.js as path.exists got moved to `fs`.
 //
-var fs = require('fs')
+const fs = require('fs')
   , path = require('path')
   , os = require('os')
-  , hook = path.join(__dirname, 'hook')
+  , util = require('node:util')
+  , exec = util.promisify(require('node:child_process').exec)
+
+const {dot} = require("mocha/lib/reporters");
+
+const gitFindHooksDirCommand = "git rev-parse --git-path hooks"
+
+
+function manuallyGetGitFolderPath(currentPath) {
+  const dotGitPath = path.resolve(currentPath, ".git")
+  return fs.promises.stat(dotGitPath)
+    .then(stats => {
+      if (stats.isDirectory()) return dotGitPath
+      else {
+        console.log(`${dotGitPath} is a file, likely it's a submodule gitfile, searching it for .git directory location`)
+        return fs.promises.readFile(dotGitPath)
+          .then(file => /^gitdir: (.+)$/gm.exec(file.toString())[1])
+          .then(dotGitPath => {
+            dotGitPath = path.resolve(dotGitPath)
+            console.log(`Found ${dotGitPath} inside submodule gitfile`)
+            return dotGitPath
+          })
+          .catch(_ => "")
+      }
+    })
+    .catch(_ => "")
+    .then(potentialPath => {
+      if (potentialPath) return path.resolve(potentialPath)
+      else {
+        console.log(`Not found: ${dotGitPath}`)
+        const parentPath = path.resolve(currentPath, "..")
+        if (parentPath === currentPath) throw Error("Reached root and couldn't find .git dir")
+        else return manuallyGetGitFolderPath(parentPath)
+      }
+    })
+}
+
+async function main() {
+  const hooksDir = await exec(gitFindHooksDirCommand)
+    .then(res => res.stdout.trim())
+    .then(path.resolve)
+    .catch(err => {
+      console.log("Couldn't get Git hooks directory location using Git:")
+      console.log(`> ${process.cwd()}$ ${gitFindHooksDirCommand}`)
+      console.log(err.stderr.trim().replace(/^/gm, `> `))
+
+      console.log("Searching up the directory tree for .git...")
+      return manuallyGetGitFolderPath('.')
+        .then(dotGitPath => {
+          return exec(`${gitFindHooksDirCommand} --git-dir=${dotGitPath}`)
+            .then(res => res.stdout.trim())
+            .catch(err => {
+              console.log("Couldn't get Git hooks directory location using Git:")
+              console.log(`> ${dotGitPath}$ ${gitFindHooksDirCommand}`)
+              console.log(err.stderr.trim().replace(/^/gm, `> `))
+            })
+        })
+        .catch(err => console.log(`Error looking for .git dir: ${err.message}`))
+    })
+    .catch(err => console.log(`Something else went wrong: ${err}`));
+
+
+  if (!hooksDir) {
+    console.log("Could not locate git hooks directory")
+    return
+  }
+
+  console.log(`Found: ${hooksDir}`)
+  const preCommitHook = path.resolve(__dirname, "pre-commit")
+  const hookRelativeDir = path.relative(hooksDir, preCommitHook)
+  await fs.promises.mkdir(hooksDir)
+    .catch(err => {
+      let x = err
+    })
+
+}
+
+main().then();
+return
+
+const hook = path.join(__dirname, 'hook')
   , root = path.resolve(__dirname, '..', '..')
-  , exists = fs.existsSync || path.existsSync;
 
-//
-// Gather the location of the possible hidden .git directory, the hooks
-// directory which contains all git hooks and the absolute location of the
-// `pre-commit` file. The path needs to be absolute in order for the symlinking
-// to work correctly.
-//
 
-var git = getGitFolderPath(root);
-
-// Function to recursively finding .git folder
-function getGitFolderPath(currentPath) {
-  var git = path.resolve(currentPath, '.git')
-
-  if (!exists(git) || !fs.lstatSync(git).isDirectory()) {
-    console.log('pre-commit:');
-    console.log('pre-commit: Not found .git folder in', git);
-    
-    var newPath = path.resolve(currentPath, '..');
-
-    // Stop if we on top folder
-    if (currentPath === newPath) {
-      return null;
-    }
-
-    return getGitFolderPath(newPath);
-  }
-
-  console.log('pre-commit:');
-  console.log('pre-commit: Found .git folder in', git);
-  return git;
-}
-
-//
-// Resolve git directory for submodules
-//
-if (exists(git) && fs.lstatSync(git).isFile()) {
-  var gitinfo = fs.readFileSync(git).toString()
-    , gitdirmatch = /gitdir: (.+)/.exec(gitinfo)
-    , gitdir = gitdirmatch.length == 2 ? gitdirmatch[1] : null;
-
-  if (gitdir !== null) {
-    git = path.resolve(root, gitdir);
-    hooks = path.resolve(git, 'hooks');
-    precommit = path.resolve(hooks, 'pre-commit');
-  }
-}
-
-//
-// Bail out if we don't have an `.git` directory as the hooks will not get
-// triggered. If we do have directory create a hooks folder if it doesn't exist.
-//
-if (!git) {
-  console.log('pre-commit:');
-  console.log('pre-commit: Not found any .git folder for installing pre-commit hook');
-  return;
-}
-
-var hooks = path.resolve(git, 'hooks')
+let hooks = path.resolve(git, 'hooks')
   , precommit = path.resolve(hooks, 'pre-commit');
 
 if (!exists(hooks)) fs.mkdirSync(hooks);
@@ -95,17 +118,17 @@ catch (e) {}
 // Create generic precommit hook that launches this modules hook (as well
 // as stashing - unstashing the unstaged changes)
 // TODO: we could keep launching the old pre-commit scripts
-var hookRelativeUnixPath = hook.replace(root, '.');
+let hookRelativeUnixPath = hook.replace(root, '.');
 
 if(os.platform() === 'win32') {
   hookRelativeUnixPath = hookRelativeUnixPath.replace(/[\\\/]+/g, '/');
 }
 
-var precommitContent = '#!/usr/bin/env bash' + os.EOL
-  +  hookRelativeUnixPath + os.EOL
-  + 'RESULT=$?' + os.EOL
-  + '[ $RESULT -ne 0 ] && exit 1' + os.EOL
-  + 'exit 0' + os.EOL;
+const precommitContent = '#!/usr/bin/env bash' + os.EOL
+    + hookRelativeUnixPath + os.EOL
+    + 'RESULT=$?' + os.EOL
+    + '[ $RESULT -ne 0 ] && exit 1' + os.EOL
+    + 'exit 0' + os.EOL;
 
 //
 // It could be that we do not have rights to this folder which could cause the
